@@ -9,6 +9,11 @@ from anime_watch.models import SearchResult, Episode, StreamSource
 from anime_watch.core import SESSION, SCRAPE_TIMEOUT
 from .base import BaseProvider
 
+# Segments come from tiktokcdn edges that are slow/unstable (especially on
+# mobile networks); the default 8s single-attempt fetch was failing there.
+_SEG_TIMEOUT = 15
+_SEG_RETRIES = 2
+
 
 def _pick_hls_variant(master_url: str, quality_pref: str) -> Optional[str]:
     target_h = int(quality_pref.replace("p", ""))
@@ -55,12 +60,35 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, playlist, variants, referer, seg_map):
+    def __init__(self, playlist, variants, referer, seg_map, playlist_url):
         self._playlist = playlist
         self._variants = variants
         self._referer = referer
         self._seg_map = seg_map
+        self._playlist_url = playlist_url
         super().__init__(("127.0.0.1", 0), _SegmentProxyHandler)
+
+    def refresh_segments(self) -> bool:
+        """Re-fetch the source playlist to get fresh signed segment URLs.
+        tiktokcdn intermittently blackholes specific signed URLs for minutes;
+        a fresh playlist yields new signatures (like a browser's player does)."""
+        try:
+            resp = SESSION.get(
+                self._playlist_url,
+                headers={"Referer": self._referer},
+                timeout=_SEG_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return False
+            seg_map: dict = {}
+            idx = [0]
+            _rewrite_media_playlist(resp.text, self._playlist_url, seg_map, idx)
+            if idx[0] == 0:
+                return False
+            self._seg_map = seg_map
+            return True
+        except requests.RequestException:
+            return False
 
 
 class _SegmentProxyHandler(BaseHTTPRequestHandler):
@@ -83,41 +111,54 @@ class _SegmentProxyHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        try:
-            resp = SESSION.get(
-                orig_url,
-                headers={"Referer": server._referer},
-                timeout=SCRAPE_TIMEOUT,
-            )
-            if resp.status_code != 200:
+        data = None
+        for _attempt in range(_SEG_RETRIES + 1):
+            try:
+                resp = SESSION.get(
+                    orig_url,
+                    headers={"Referer": server._referer},
+                    timeout=_SEG_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.content
+                    break
+            except requests.RequestException:
+                pass
+            if data is not None:
+                break
+            # This signed URL is (likely) blackholed by tiktokcdn: rotate to a
+            # fresh signed URL from the source playlist (like a browser player).
+            if not server.refresh_segments():
+                break
+            orig_url = server._seg_map.get(path)
+            if not orig_url:
+                break
+        if data is None:
+            try:
                 self.send_response(502)
                 self.end_headers()
-                return
-            data = resp.content
-            if data[:1] == b"\x89":
-                offset = 8
-                while offset < len(data) - 8:
-                    chunk_len = int.from_bytes(data[offset:offset+4], 'big')
-                    if data[offset+4:offset+8] == b"IEND":
-                        data = data[offset + 12:]
-                        break
-                    offset += 12 + chunk_len
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+        if data[:1] == b"\x89":
+            # Segments are PNG-wrapped: the MPEG-TS payload follows the IEND chunk.
+            offset = 8
+            while offset < len(data) - 8:
+                chunk_len = int.from_bytes(data[offset:offset+4], 'big')
+                if data[offset+4:offset+8] == b"IEND":
+                    data = data[offset + 12:]
+                    break
+                offset += 12 + chunk_len
+        try:
             self.send_response(200)
             self.send_header("Content-Type", "video/MP2T")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Connection", "close")
             self.send_header("Access-Control-Allow-Origin", "*")
-            try:
-                self.end_headers()
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-        except Exception:
-            try:
-                self.send_response(502)
-                self.end_headers()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _serve_text(self, content: str):
         data = content.encode()
@@ -201,7 +242,7 @@ def _proxy_hls(playlist_url: str, referer: str, cdn_domain: str) -> tuple[str, H
     if idx[0] == 0:
         return playlist_url, None
 
-    server = _ProxyHTTPServer(rewritten, variants, referer, seg_map)
+    server = _ProxyHTTPServer(rewritten, variants, referer, seg_map, playlist_url)
     port = server.server_address[1]
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
