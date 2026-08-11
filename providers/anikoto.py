@@ -1,9 +1,11 @@
-import json, os, tempfile, uuid, threading, socketserver
+import json, os, socket, tempfile, uuid, threading, socketserver
 import re
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urlencode
+import json as _json
+import urllib.request as _urllib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from anime_watch.models import SearchResult, Episode, StreamSource
 from anime_watch.core import SESSION, SCRAPE_TIMEOUT
@@ -13,6 +15,58 @@ from .base import BaseProvider
 # mobile networks); the default 8s single-attempt fetch was failing there.
 _SEG_TIMEOUT = 15
 _SEG_RETRIES = 2
+
+def _doh_resolve(host: str) -> list[str]:
+    """Resolve a host via Google DoH. Android's system DNS can return a
+    tiktokcdn edge IP that is unreachable from the device while other edges
+    (e.g. dns.google's answer) connect fine."""
+    try:
+        req = _urllib.Request(
+            f"https://dns.google/resolve?name={host}&type=A",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        data = _json.loads(_urllib.urlopen(req, timeout=10).read())
+        return [a["data"] for a in data.get("Answer", []) if a.get("type") == 1][:5]
+    except Exception:
+        return []
+
+def _ip_reachable(url: str, timeout: float = 4.0) -> bool:
+    """Quick TCP probe of the host's default-resolved IPs. Android's system
+    DNS can return a tiktokcdn edge IP that is unreachable from the device,
+    which normally costs 3x15s of retries before the DoH fallback."""
+    try:
+        host = urlparse(url).netloc
+        for ip in sorted({i[4][0] for i in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)}):
+            try:
+                s = socket.create_connection((ip, 443), timeout=timeout)
+                s.close()
+                return True
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return False
+
+def _fetch_pinned(url: str, referer: str, timeout: float) -> Optional[bytes]:
+    """Fetch an HTTPS URL via a DoH-resolved IP with SNI pinned to the host."""
+    try:
+        from urllib3 import HTTPSConnectionPool
+        u = urlparse(url)
+        if not u.scheme or not u.netloc:
+            return None
+        path = u.path + (("?" + u.query) if u.query else "")
+        for ip in _doh_resolve(u.netloc):
+            try:
+                pool = HTTPSConnectionPool(ip, server_hostname=u.netloc,
+                                           cert_reqs="CERT_REQUIRED", timeout=timeout)
+                resp = pool.request("GET", path, headers={"Host": u.netloc, "Referer": referer})
+                if resp.status == 200 and resp.data:
+                    return resp.data
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
 
 
 def _pick_hls_variant(master_url: str, quality_pref: str) -> Optional[str]:
@@ -112,27 +166,35 @@ class _SegmentProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         data = None
-        for _attempt in range(_SEG_RETRIES + 1):
-            try:
-                resp = SESSION.get(
-                    orig_url,
-                    headers={"Referer": server._referer},
-                    timeout=_SEG_TIMEOUT,
-                )
-                if resp.status_code == 200:
-                    data = resp.content
+        if not _ip_reachable(orig_url):
+            # The system-resolved edge is unreachable from this network
+            # (common on Android): go straight to the DoH-pinned fetch.
+            data = _fetch_pinned(orig_url, server._referer, _SEG_TIMEOUT)
+        if data is None:
+            for _attempt in range(_SEG_RETRIES + 1):
+                try:
+                    resp = SESSION.get(
+                        orig_url,
+                        headers={"Referer": server._referer},
+                        timeout=_SEG_TIMEOUT,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.content
+                        break
+                except requests.RequestException:
+                    pass
+                if data is not None:
                     break
-            except requests.RequestException:
-                pass
-            if data is not None:
-                break
-            # This signed URL is (likely) blackholed by tiktokcdn: rotate to a
-            # fresh signed URL from the source playlist (like a browser player).
-            if not server.refresh_segments():
-                break
-            orig_url = server._seg_map.get(path)
-            if not orig_url:
-                break
+                # This signed URL is (likely) blackholed by tiktokcdn: rotate
+                # to a fresh signed URL from the source playlist.
+                if not server.refresh_segments():
+                    break
+                orig_url = server._seg_map.get(path)
+                if not orig_url:
+                    break
+        if data is None:
+            # Last resort: DoH-pinned fetch against an alternate edge.
+            data = _fetch_pinned(orig_url, server._referer, _SEG_TIMEOUT)
         if data is None:
             try:
                 self.send_response(502)
