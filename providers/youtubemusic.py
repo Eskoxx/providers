@@ -25,9 +25,20 @@ def _norm_title(title: str) -> str:
     return _re.sub(r"\s+", " ", t).strip()
 
 
-def _yt_client():
+def ytmusic_client():
+    """Import ytmusicapi from the VENDORED copy shipped with the providers
+    feed (providers/ytmusicapi) — pure Python, no pip/APK needed on Android.
+    Falls back to any pip-installed copy if the vendored one is absent."""
+    import sys as _sys
+    _dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _dir not in _sys.path:
+        _sys.path.insert(0, _dir)
     from ytmusicapi import YTMusic
     return YTMusic()
+
+
+def _yt_client():
+    return ytmusic_client()
 
 
 def _fmt_duration(seconds: int) -> str:

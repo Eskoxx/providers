@@ -50,6 +50,46 @@ def _new_session():
     s.headers.update(BROWSER_HEADERS)
     return s
 
+def _unmask_png(data: bytes) -> bytes:
+    """Strip a PNG shell from a media segment. The CDN wraps real MPEG-TS
+    payload after the PNG's IEND chunk (1x1 transparent image trick) to
+    block naive downloading; players choke on the PNG magic bytes."""
+    if data[:1] != b"\x89" or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return data
+    offset = 8
+    while offset < len(data) - 8:
+        chunk_len = int.from_bytes(data[offset:offset + 4], "big")
+        if data[offset + 4:offset + 8] == b"IEND":
+            return data[offset + 12:]
+        offset += 12 + chunk_len
+    return data
+
+
+def _rewrite_playlist(data: bytes, playlist_url: str, server) -> bytes:
+    """Rewrite an HLS playlist so every segment (absolute or relative) is
+    fetched THROUGH this proxy, where the PNG shell is stripped. Without
+    this the player hits the CDN directly and gets PNG-wrapped garbage."""
+    from urllib.parse import quote
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    out = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        sline = line.strip()
+        if sline and not sline.startswith("#"):
+            target = sline if sline.startswith("http") else \
+                playlist_url.rsplit("/", 1)[0] + "/" + sline
+            out.append(f"{base}/m3u8-proxy?url={quote(target, safe='')}")
+        elif 'URI="' in line:
+            def _sub(m):
+                uri = m.group(1)
+                target = uri if uri.startswith("http") else \
+                    playlist_url.rsplit("/", 1)[0] + "/" + uri
+                return f'URI="{base}/m3u8-proxy?url={quote(target, safe="")}"'
+            out.append(re.sub(r'URI="([^"]*)"', _sub, line))
+        else:
+            out.append(line)
+    return ("\n".join(out) + "\n").encode()
+
+
 class _ProxyRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         server = self.server  # type: ignore[attr-defined]
@@ -71,15 +111,7 @@ class _ProxyRequestHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
                 resp = s.get(target_url, headers=extra_headers, timeout=30)
-                data = resp.content
-                if data[:1] == b"\x89":
-                    offset = 8
-                    while offset < len(data) - 8:
-                        chunk_len = int.from_bytes(data[offset:offset+4], 'big')
-                        if data[offset+4:offset+8] == b"IEND":
-                            data = data[offset + 12:]
-                            break
-                        offset += 12 + chunk_len
+                data = _unmask_png(resp.content)
                 self.send_response(resp.status_code)
                 self.send_header("Content-Type", "video/MP2T")
                 self.send_header("Content-Length", str(len(data)))
@@ -91,13 +123,24 @@ class _ProxyRequestHandler(BaseHTTPRequestHandler):
 
             url = server._target_url + path
             resp = s.get(url, headers={"Referer": TRYEMBED_HOST, "Origin": TRYEMBED_HOST}, timeout=30)
+            data = _unmask_png(resp.content)
+            rewritten = False
+            if data.startswith(b"#EXTM3U") or data.lstrip().startswith(b"#EXTM3U"):
+                data = _rewrite_playlist(data, url, self.server)
+                rewritten = True
             self.send_response(resp.status_code)
-            for key, val in resp.headers.items():
-                if key.lower() in ("content-type", "content-length", "content-range", "accept-ranges"):
-                    self.send_header(key, val)
+            if rewritten:
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            elif data is resp.content:
+                for key, val in resp.headers.items():
+                    if key.lower() in ("content-type", "content-range", "accept-ranges"):
+                        self.send_header(key, val)
+            else:
+                self.send_header("Content-Type", "video/MP2T")
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             if resp.status_code == 200:
-                self.wfile.write(resp.content)
+                self.wfile.write(data)
         except Exception as e:
             self.send_response(502)
             self.end_headers()
