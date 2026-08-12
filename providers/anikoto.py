@@ -1,4 +1,5 @@
 import json, os, socket, tempfile, uuid, threading, socketserver
+from concurrent.futures import ThreadPoolExecutor
 import re
 from typing import Optional
 import requests
@@ -69,10 +70,38 @@ def _fetch_pinned(url: str, referer: str, timeout: float) -> Optional[bytes]:
     return None
 
 
+class _HttpResp:
+    """Minimal response shim with the fields the provider uses."""
+    def __init__(self, status: int, content: bytes):
+        self.status_code = status
+        self.content = content
+        self.text = content.decode("utf-8", "replace")
+    def json(self):
+        return _json.loads(self.text)
+
+
+def _http_get(url: str, headers: Optional[dict] = None, timeout: float = SCRAPE_TIMEOUT,
+            params: Optional[dict] = None) -> _HttpResp:
+    """GET via the shared session; when the system DNS fails to resolve
+    (flaky on Android), fall back to a DoH-resolved IP with SNI pinned."""
+    if params:
+        url += ("&" if "?" in url else "?") + urlencode(params)
+    hdrs = dict(headers or {})
+    try:
+        resp = SESSION.get(url, headers=hdrs, timeout=timeout)
+        return _HttpResp(resp.status_code, resp.content)
+    except requests.ConnectionError:
+        pass
+    data = _fetch_pinned(url, hdrs.get("Referer", ""), timeout)
+    if data is None:
+        return _HttpResp(502, b"")
+    return _HttpResp(200, data)
+
+
 def _pick_hls_variant(master_url: str, quality_pref: str) -> Optional[str]:
     target_h = int(quality_pref.replace("p", ""))
     try:
-        resp = SESSION.get(
+        resp = _http_get(
             master_url,
             headers={"Referer": "https://megaplay.buzz/"},
             timeout=SCRAPE_TIMEOUT,
@@ -120,14 +149,80 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         self._referer = referer
         self._seg_map = seg_map
         self._playlist_url = playlist_url
+        self._seg_cache: dict[str, bytes] = {}
+        self._prefetcher = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ankpre")
+        self._dns_ok = True
         super().__init__(("127.0.0.1", 0), _SegmentProxyHandler)
+        # Warm the first segments immediately so playback starts as soon as
+        # the player connects instead of waiting per-segment.
+        try:
+            for k in self._ordered_paths()[:5]:
+                self._prefetcher.submit(self.fetch_segment, k)
+        except Exception:
+            pass
+
+    def _ordered_paths(self) -> list[str]:
+        keys = [k for k in self._seg_map.keys() if k.startswith("/seg/")]
+        keys.sort(key=lambda k: int(k[len("/seg/"):]))
+        return keys
+
+    def prefetch(self, path: str, ahead: int = 4) -> None:
+        """Pre-fetch the next segments after the requested one so the player
+        never waits on the slow CDN between segments (segment attach lag)."""
+        try:
+            keys = self._ordered_paths()
+            if path not in keys:
+                return
+            idx = keys.index(path)
+            for k in keys[idx + 1:idx + 1 + ahead]:
+                if k in self._seg_cache:
+                    continue
+                self._prefetcher.submit(self.fetch_segment, k)
+        except Exception:
+            pass
+
+    def fetch_segment(self, path: str) -> Optional[bytes]:
+        """Fetch a segment with probe-first + rotate + DoH-pinned fallbacks."""
+        orig_url = self._seg_map.get(path)
+        if not orig_url:
+            return None
+        data: Optional[bytes] = None
+        if self._dns_ok and not _ip_reachable(orig_url):
+            self._dns_ok = False
+        if not self._dns_ok:
+            data = _fetch_pinned(orig_url, self._referer, _SEG_TIMEOUT)
+        if data is None:
+            for _attempt in range(_SEG_RETRIES + 1):
+                try:
+                    resp = _http_get(
+                        orig_url,
+                        headers={"Referer": self._referer},
+                        timeout=_SEG_TIMEOUT,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.content
+                        break
+                except requests.RequestException:
+                    pass
+                if data is not None:
+                    break
+                if not self.refresh_segments():
+                    break
+                orig_url = self._seg_map.get(path)
+                if not orig_url:
+                    break
+        if data is None:
+            data = _fetch_pinned(orig_url, self._referer, _SEG_TIMEOUT)
+        if data is not None:
+            self._seg_cache[path] = data
+        return data
 
     def refresh_segments(self) -> bool:
         """Re-fetch the source playlist to get fresh signed segment URLs.
         tiktokcdn intermittently blackholes specific signed URLs for minutes;
         a fresh playlist yields new signatures (like a browser's player does)."""
         try:
-            resp = SESSION.get(
+            resp = _http_get(
                 self._playlist_url,
                 headers={"Referer": self._referer},
                 timeout=_SEG_TIMEOUT,
@@ -165,36 +260,10 @@ class _SegmentProxyHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        data = None
-        if not _ip_reachable(orig_url):
-            # The system-resolved edge is unreachable from this network
-            # (common on Android): go straight to the DoH-pinned fetch.
-            data = _fetch_pinned(orig_url, server._referer, _SEG_TIMEOUT)
+        data = server._seg_cache.get(path)
         if data is None:
-            for _attempt in range(_SEG_RETRIES + 1):
-                try:
-                    resp = SESSION.get(
-                        orig_url,
-                        headers={"Referer": server._referer},
-                        timeout=_SEG_TIMEOUT,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.content
-                        break
-                except requests.RequestException:
-                    pass
-                if data is not None:
-                    break
-                # This signed URL is (likely) blackholed by tiktokcdn: rotate
-                # to a fresh signed URL from the source playlist.
-                if not server.refresh_segments():
-                    break
-                orig_url = server._seg_map.get(path)
-                if not orig_url:
-                    break
-        if data is None:
-            # Last resort: DoH-pinned fetch against an alternate edge.
-            data = _fetch_pinned(orig_url, server._referer, _SEG_TIMEOUT)
+            data = server.fetch_segment(path)
+        server.prefetch(path)
         if data is None:
             try:
                 self.send_response(502)
@@ -257,7 +326,7 @@ def _rewrite_media_playlist(body: str, playlist_url: str, seg_map: dict, idx: li
 
 
 def _proxy_hls(playlist_url: str, referer: str, cdn_domain: str) -> tuple[str, HTTPServer]:
-    resp = SESSION.get(
+    resp = _http_get(
         playlist_url,
         headers={"Referer": referer},
         timeout=SCRAPE_TIMEOUT,
@@ -283,7 +352,7 @@ def _proxy_hls(playlist_url: str, referer: str, cdn_domain: str) -> tuple[str, H
                 if next_line:
                     v_url = next_line if "://" in next_line else f"{base}/{next_line.lstrip('/')}"
                     try:
-                        v_resp = SESSION.get(v_url, headers={"Referer": referer}, timeout=SCRAPE_TIMEOUT)
+                        v_resp = _http_get(v_url, headers={"Referer": referer}, timeout=SCRAPE_TIMEOUT)
                         if v_resp.status_code == 200:
                             v_path = f"/v/{len(variants)}"
                             v_rewritten = _rewrite_media_playlist(v_resp.text, v_url, seg_map, idx)
@@ -329,7 +398,7 @@ class AnikotoProvider(BaseProvider):
         results = []
         ql = query.lower()
         try:
-            resp = SESSION.get(
+            resp = _http_get(
                 f"{self.url}/filter",
                 params={"keyword": query},
                 timeout=SCRAPE_TIMEOUT,
@@ -367,7 +436,7 @@ class AnikotoProvider(BaseProvider):
         an = result.title.split(" (")[0].strip()
 
         try:
-            resp = SESSION.get(
+            resp = _http_get(
                 f"{self.url}/ajax/episode/list/{media_id}",
                 headers={"X-Requested-With": "XMLHttpRequest", "Referer": result.url},
                 timeout=SCRAPE_TIMEOUT,
@@ -407,7 +476,7 @@ class AnikotoProvider(BaseProvider):
         servers = []
         seen = set()
         try:
-            resp = SESSION.get(
+            resp = _http_get(
                 f"{self.url}/ajax/server/list?servers={data_ids}",
                 headers={"X-Requested-With": "XMLHttpRequest", "Referer": episode.url},
                 timeout=SCRAPE_TIMEOUT,
@@ -447,7 +516,7 @@ class AnikotoProvider(BaseProvider):
         ts = episode.data.get("ts", "")
         if mal_id and slug and ts:
             try:
-                r2 = SESSION.get(
+                r2 = _http_get(
                     f"https://mapper.nekostream.site/api/mal/{mal_id}/{slug}/{ts}",
                     timeout=SCRAPE_TIMEOUT,
                 )
@@ -525,7 +594,7 @@ class AnikotoProvider(BaseProvider):
                 return None
 
         try:
-            resp = SESSION.get(
+            resp = _http_get(
                 f"{self.url}/ajax/server?get={link_id}",
                 headers={"X-Requested-With": "XMLHttpRequest", "Referer": episode.url},
                 timeout=SCRAPE_TIMEOUT,
@@ -552,7 +621,7 @@ class AnikotoProvider(BaseProvider):
             return None
 
         try:
-            embed_resp = SESSION.get(
+            embed_resp = _http_get(
                 embed_url,
                 headers={"Referer": self.url},
                 timeout=SCRAPE_TIMEOUT,
@@ -569,7 +638,7 @@ class AnikotoProvider(BaseProvider):
             api_url = f"{api_base}/stream/getSources?id={file_id}"
             if audio_type == "dub":
                 api_url += "&type=dub"
-            sources_resp = SESSION.get(
+            sources_resp = _http_get(
                 api_url,
                 headers={
                     "Referer": embed_url,
@@ -617,7 +686,7 @@ class AnikotoProvider(BaseProvider):
 
     def _extract_generic(self, embed_url: str, quality_pref: str) -> Optional[StreamSource]:
         try:
-            resp = SESSION.get(
+            resp = _http_get(
                 embed_url,
                 headers={"Referer": self.url},
                 timeout=SCRAPE_TIMEOUT,
