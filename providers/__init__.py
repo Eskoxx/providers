@@ -19,6 +19,7 @@ from .moviebox import MovieBoxProvider
 from .streamingunity import StreamingUnityProvider
 from .tmdb_search import TMDbProvider
 from .torrentprovider import TPBProvider, EZTVProvider, NyaaProvider
+from .youtubemusic import YouTubeMusicProvider
 from .loader import discover_providers
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,13 @@ MOVIE_PROVIDERS: dict[str, "BaseProvider"] = {
     "tmdb": TMDbProvider(),
 }
 
+MUSIC_SITES: list[Site] = [
+    Site(name="ytmusic", slug="ytmusic", url="https://music.youtube.com", rank=1, category="music"),
+]
+MUSIC_PROVIDERS: dict[str, "BaseProvider"] = {
+    "ytmusic": YouTubeMusicProvider(),
+}
+
 TORRENT_SITES: list[Site] = [
     Site(name="TPB", slug="tpb", url="https://thepiratebay.org", rank=1, category="torrent"),
     Site(name="EZTV", slug="eztv", url="https://eztvx.to", rank=2, category="torrent"),
@@ -65,8 +73,8 @@ TORRENT_PROVIDERS: dict[str, TPBProvider | EZTVProvider | NyaaProvider] = {
     "nyaa": NyaaProvider(),
 }
 
-CONFIGURED_PROVIDERS = {**ANIME_PROVIDERS, **MOVIE_PROVIDERS}
-CONFIGURED_SITES = ANIME_SITES + MOVIE_SITES + TORRENT_SITES
+CONFIGURED_PROVIDERS = {**ANIME_PROVIDERS, **MOVIE_PROVIDERS, **MUSIC_PROVIDERS}
+CONFIGURED_SITES = ANIME_SITES + MOVIE_SITES + TORRENT_SITES + MUSIC_SITES
 
 # Merge user-provided plugins
 _plugins = discover_providers()
@@ -83,10 +91,14 @@ for _key, (_provider, _site) in _plugins.items():
     elif cat == "movies":
         MOVIE_SITES.append(_site)
         MOVIE_PROVIDERS[_key] = _provider
+    elif cat == "music":
+        MUSIC_SITES.append(_site)
+        MUSIC_PROVIDERS[_key] = _provider
 
 ANIME_SITES.sort(key=lambda s: s.rank)
 MOVIE_SITES.sort(key=lambda s: s.rank)
 TORRENT_SITES.sort(key=lambda s: s.rank)
+MUSIC_SITES.sort(key=lambda s: s.rank)
 
 _TARGET_PROVIDER: str = ""
 
@@ -251,9 +263,20 @@ def _paginate_episodes(episodes: list[Episode], page_size: int = PAGE_SIZE) -> l
     return result
 
 
+def _provider_for(site_name: str) -> Optional[BaseProvider]:
+    """Resolve a provider by site name; falls back to matching the provider's
+    display name (multi-word names like 'YouTube Music')."""
+    key = site_name.lower().strip()
+    prov = CONFIGURED_PROVIDERS.get(key)
+    if prov is None:
+        for slug, p in CONFIGURED_PROVIDERS.items():
+            if p.name.lower() == key:
+                return p
+    return prov
+
+
 def get_episodes(result: SearchResult) -> list[Episode]:
-    key = result.site_name.lower().strip()
-    provider = CONFIGURED_PROVIDERS.get(key)
+    provider = _provider_for(result.site_name)
     if provider:
         eps = provider.get_episodes(result)
     else:
@@ -272,8 +295,7 @@ def get_episodes(result: SearchResult) -> list[Episode]:
     return eps
 
 def extract_stream(episode: Episode, audio_pref: str = "sub", quality_pref: str = "best") -> Optional[StreamSource]:
-    key = episode.site_name.lower().strip()
-    provider = CONFIGURED_PROVIDERS.get(key)
+    provider = _provider_for(episode.site_name)
     if provider:
         return provider.extract_stream(episode, audio_pref, quality_pref)
         
