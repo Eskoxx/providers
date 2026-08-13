@@ -1,4 +1,4 @@
-import json, os, socket, tempfile, uuid, threading, socketserver
+import json, os, tempfile, uuid, threading, socketserver
 from concurrent.futures import ThreadPoolExecutor
 import re
 from typing import Optional
@@ -6,68 +6,17 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, quote, urlencode
 import json as _json
-import urllib.request as _urllib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from anime_watch.models import SearchResult, Episode, StreamSource
 from anime_watch.core import SESSION, SCRAPE_TIMEOUT
 from .base import BaseProvider
 
-# Segments come from tiktokcdn edges that are slow/unstable (especially on
-# mobile networks); the default 8s single-attempt fetch was failing there.
+# Segments come from tiktokcdn edges that intermittently blackhole the IP
+# for seconds-to-minutes (known anikoto CDN behavior). Retry with a short
+# backoff between attempts and rotate the playlist for fresh signed URLs.
 _SEG_TIMEOUT = 15
-_SEG_RETRIES = 2
-
-def _doh_resolve(host: str) -> list[str]:
-    """Resolve a host via Google DoH. Android's system DNS can return a
-    tiktokcdn edge IP that is unreachable from the device while other edges
-    (e.g. dns.google's answer) connect fine."""
-    try:
-        req = _urllib.Request(
-            f"https://dns.google/resolve?name={host}&type=A",
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        data = _json.loads(_urllib.urlopen(req, timeout=10).read())
-        return [a["data"] for a in data.get("Answer", []) if a.get("type") == 1][:5]
-    except Exception:
-        return []
-
-def _ip_reachable(url: str, timeout: float = 4.0) -> bool:
-    """Quick TCP probe of the host's default-resolved IPs. Android's system
-    DNS can return a tiktokcdn edge IP that is unreachable from the device,
-    which normally costs 3x15s of retries before the DoH fallback."""
-    try:
-        host = urlparse(url).netloc
-        for ip in sorted({i[4][0] for i in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)}):
-            try:
-                s = socket.create_connection((ip, 443), timeout=timeout)
-                s.close()
-                return True
-            except OSError:
-                continue
-    except Exception:
-        pass
-    return False
-
-def _fetch_pinned(url: str, referer: str, timeout: float) -> Optional[bytes]:
-    """Fetch an HTTPS URL via a DoH-resolved IP with SNI pinned to the host."""
-    try:
-        from urllib3 import HTTPSConnectionPool
-        u = urlparse(url)
-        if not u.scheme or not u.netloc:
-            return None
-        path = u.path + (("?" + u.query) if u.query else "")
-        for ip in _doh_resolve(u.netloc):
-            try:
-                pool = HTTPSConnectionPool(ip, server_hostname=u.netloc,
-                                           cert_reqs="CERT_REQUIRED", timeout=timeout)
-                resp = pool.request("GET", path, headers={"Host": u.netloc, "Referer": referer})
-                if resp.status == 200 and resp.data:
-                    return resp.data
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
+_SEG_RETRIES = 12
+_SEG_RETRY_SLEEP = 1.0
 
 
 class _HttpResp:
@@ -82,8 +31,7 @@ class _HttpResp:
 
 def _http_get(url: str, headers: Optional[dict] = None, timeout: float = SCRAPE_TIMEOUT,
             params: Optional[dict] = None) -> _HttpResp:
-    """GET via the shared session; when the system DNS fails to resolve
-    (flaky on Android), fall back to a DoH-resolved IP with SNI pinned."""
+    """GET via the shared session."""
     if params:
         url += ("&" if "?" in url else "?") + urlencode(params)
     hdrs = dict(headers or {})
@@ -92,10 +40,7 @@ def _http_get(url: str, headers: Optional[dict] = None, timeout: float = SCRAPE_
         return _HttpResp(resp.status_code, resp.content)
     except requests.ConnectionError:
         pass
-    data = _fetch_pinned(url, hdrs.get("Referer", ""), timeout)
-    if data is None:
-        return _HttpResp(502, b"")
-    return _HttpResp(200, data)
+    return _HttpResp(502, b"")
 
 
 def _pick_hls_variant(master_url: str, quality_pref: str) -> Optional[str]:
@@ -143,15 +88,18 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, playlist, variants, referer, seg_map, playlist_url):
+    def __init__(self, playlist, variants, referer, seg_map, playlist_url, variant_src_urls=None):
         self._playlist = playlist
         self._variants = variants
         self._referer = referer
         self._seg_map = seg_map
         self._playlist_url = playlist_url
+        self._variant_src_urls = variant_src_urls or {}
         self._seg_cache: dict[str, bytes] = {}
-        self._prefetcher = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ankpre")
-        self._dns_ok = True
+        # Low concurrency: the tiktokcdn edge blackholes bursts of parallel
+        # connections from one IP for seconds; a gentle prefetch avoids
+        # tripping it harder while the player streams.
+        self._prefetcher = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ankpre")
         super().__init__(("127.0.0.1", 0), _SegmentProxyHandler)
         # Warm the first segments immediately so playback starts as soon as
         # the player connects instead of waiting per-segment.
@@ -182,62 +130,72 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
             pass
 
     def fetch_segment(self, path: str) -> Optional[bytes]:
-        """Fetch a segment with probe-first + rotate + DoH-pinned fallbacks."""
+        """Fetch a segment with retries + backoff + fresh-playlist rotation."""
+        import time as _time
         orig_url = self._seg_map.get(path)
         if not orig_url:
             return None
         data: Optional[bytes] = None
-        if self._dns_ok and not _ip_reachable(orig_url):
-            self._dns_ok = False
-        if not self._dns_ok:
-            data = _fetch_pinned(orig_url, self._referer, _SEG_TIMEOUT)
-        if data is None:
-            for _attempt in range(_SEG_RETRIES + 1):
-                try:
-                    resp = _http_get(
-                        orig_url,
-                        headers={"Referer": self._referer},
-                        timeout=_SEG_TIMEOUT,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.content
-                        break
-                except requests.RequestException:
-                    pass
-                if data is not None:
+        for attempt in range(_SEG_RETRIES + 1):
+            try:
+                resp = _http_get(
+                    orig_url,
+                    headers={"Referer": self._referer},
+                    timeout=_SEG_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.content
                     break
+            except requests.RequestException:
+                pass
+            if data is not None:
+                break
+            if attempt < _SEG_RETRIES:
                 if not self.refresh_segments():
-                    break
+                    _time.sleep(_SEG_RETRY_SLEEP)
                 orig_url = self._seg_map.get(path)
                 if not orig_url:
                     break
-        if data is None:
-            data = _fetch_pinned(orig_url, self._referer, _SEG_TIMEOUT)
         if data is not None:
             self._seg_cache[path] = data
         return data
 
     def refresh_segments(self) -> bool:
-        """Re-fetch the source playlist to get fresh signed segment URLs.
+        """Re-fetch the source playlists to get fresh signed segment URLs.
+
         tiktokcdn intermittently blackholes specific signed URLs for minutes;
-        a fresh playlist yields new signatures (like a browser's player does)."""
+        a fresh playlist yields new signatures (like a browser's player does).
+        IMPORTANT: rewrite the MEDIA playlists (the variants), not the master —
+        rewriting a master maps the variant URL itself into the segment map
+        and destroys it."""
+        seg_map: dict = {}
+        idx = [0]
         try:
-            resp = _http_get(
-                self._playlist_url,
-                headers={"Referer": self._referer},
-                timeout=_SEG_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                return False
-            seg_map: dict = {}
-            idx = [0]
-            _rewrite_media_playlist(resp.text, self._playlist_url, seg_map, idx)
-            if idx[0] == 0:
-                return False
-            self._seg_map = seg_map
-            return True
+            if self._variant_src_urls:
+                for v_path, src in self._variant_src_urls.items():
+                    resp = _http_get(
+                        src,
+                        headers={"Referer": self._referer},
+                        timeout=_SEG_TIMEOUT,
+                    )
+                    if resp.status_code != 200:
+                        return False
+                    _rewrite_media_playlist(resp.text, src, seg_map, idx)
+            else:
+                resp = _http_get(
+                    self._playlist_url,
+                    headers={"Referer": self._referer},
+                    timeout=_SEG_TIMEOUT,
+                )
+                if resp.status_code != 200:
+                    return False
+                _rewrite_media_playlist(resp.text, self._playlist_url, seg_map, idx)
         except requests.RequestException:
             return False
+        if idx[0] == 0:
+            return False
+        self._seg_map = seg_map
+        return True
 
 
 class _SegmentProxyHandler(BaseHTTPRequestHandler):
@@ -247,7 +205,13 @@ class _SegmentProxyHandler(BaseHTTPRequestHandler):
         if path == "/playlist.m3u8":
             self._serve_text(server._playlist)
             return
-        if path.startswith("/v/"):
+        # Segment paths must be checked before /v/ variants: a variant
+        # playlist served at /v/<n> carries /seg/<m> lines that resolve to
+        # /v/seg/<m> — routing those into the variant map 404s playback.
+        orig_url = server._seg_map.get(path)
+        if orig_url is None and path.startswith("/v/seg/"):
+            orig_url = server._seg_map.get(path[len("/v"):])
+        if orig_url is None and path.startswith("/v/"):
             variant = server._variants.get(path)
             if variant:
                 self._serve_text(variant)
@@ -255,8 +219,7 @@ class _SegmentProxyHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
             return
-        orig_url = server._seg_map.get(path)
-        if not orig_url:
+        if orig_url is None:
             self.send_response(404)
             self.end_headers()
             return
@@ -339,9 +302,11 @@ def _proxy_hls(playlist_url: str, referer: str, cdn_domain: str) -> tuple[str, H
     idx = [0]
     if "#EXT-X-STREAM-INF:" in body:
         variants = {}
+        variant_src_urls = {}
         lines = body.splitlines()
         new_lines = []
         base = playlist_url.rsplit("/", 1)[0]
+        consumed_next = False
         for i, line in enumerate(lines):
             if line.startswith("#EXT-X-STREAM-INF:"):
                 next_line = ""
@@ -357,12 +322,23 @@ def _proxy_hls(playlist_url: str, referer: str, cdn_domain: str) -> tuple[str, H
                             v_path = f"/v/{len(variants)}"
                             v_rewritten = _rewrite_media_playlist(v_resp.text, v_url, seg_map, idx)
                             variants[v_path] = v_rewritten
+                            variant_src_urls[v_path] = v_url
                             new_lines.append(line)
                             new_lines.append(v_path)
+                            consumed_next = True
                             continue
                     except requests.RequestException:
                         pass
-            new_lines.append(line)
+            if consumed_next:
+                consumed_next = False
+                continue
+            if line.startswith("#") or not line.strip():
+                new_lines.append(line)
+                continue
+            # A bare media line in a MASTER playlist that wasn't consumed as a
+            # variant (duplicate refs, i-frame URLs) is not servable locally.
+            if not variants:
+                new_lines.append(line)
         if not variants:
             return playlist_url, None
         rewritten = "\n".join(new_lines)
@@ -373,7 +349,8 @@ def _proxy_hls(playlist_url: str, referer: str, cdn_domain: str) -> tuple[str, H
     if idx[0] == 0:
         return playlist_url, None
 
-    server = _ProxyHTTPServer(rewritten, variants, referer, seg_map, playlist_url)
+    server = _ProxyHTTPServer(rewritten, variants, referer, seg_map, playlist_url,
+                              variant_src_urls=locals().get("variant_src_urls", {}))
     port = server.server_address[1]
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -582,16 +559,23 @@ class AnikotoProvider(BaseProvider):
             if not link_id:
                 return None
         else:
-            for sv in servers:
-                if sv.get("type") == audio_pref and sv.get("link_id"):
-                    link_id = sv["link_id"]
-                    audio_type = audio_pref
-                    break
-            if not link_id:
-                link_id = servers[0].get("link_id", "")
-                audio_type = servers[0].get("type", audio_pref)
-            if not link_id:
+            # Auto-pick: prefer servers whose segments don't ride the flaky
+            # tiktokcdn edge (Vidstream-2) — HD-1/VidPlay-1 use trycloud/akirax
+            # and are reliable. Fall back to Vidstream-2 only if nothing else
+            # matches the requested audio type.
+            def _reliability(sv):
+                return 0 if "vidstream" in sv.get("name", "").lower() else 1
+            candidates = sorted(
+                (sv for sv in servers if sv.get("type") == audio_pref and sv.get("link_id")),
+                key=_reliability,
+                reverse=True,
+            )
+            if not candidates:
+                candidates = [sv for sv in servers if sv.get("link_id")]
+            if not candidates:
                 return None
+            link_id = candidates[0]["link_id"]
+            audio_type = candidates[0].get("type", audio_pref)
 
         try:
             resp = _http_get(

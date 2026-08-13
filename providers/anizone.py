@@ -78,6 +78,45 @@ def _extract_json_arg(xdata: str, key: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _js_unescape(s: str) -> str:
+    """Unescape a JS single-quoted string body (\\uXXXX, \\/, \\\\, \\')."""
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt == "u" and i + 6 <= n:
+            try:
+                out.append(chr(int(s[i + 2:i + 6], 16)))
+                i += 6
+                continue
+            except ValueError:
+                pass
+        out.append({"n": "\n", "t": "\t", "r": "\r", "/": "/", "\\": "\\", "'": "'"}.get(nxt, nxt))
+        i += 2
+    return "".join(out)
+
+
+def _parse_vidstack_blob(text: str) -> Optional[dict]:
+    """Extract the vidstackPlayer(JSON.parse('...')) payload (src + subtitles).
+
+    anizone's episode page only includes this Alpine blob when the request
+    looks like a browser navigation (Sec-Fetch-Mode/Site headers); a plain
+    GET gets a page without any stream data."""
+    m = re.search(r"vidstackPlayer\(JSON\.parse\('((?:[^'\\]|\\.)*)'\)\)", text)
+    if not m:
+        return None
+    try:
+        return json.loads(_js_unescape(m.group(1)))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 class AniZoneProvider(BaseProvider):
     name = "AniZone"
     slug = "anizone"
@@ -249,35 +288,70 @@ class AniZoneProvider(BaseProvider):
                 slug, ep_num = m.group(1), m.group(2)
         if not slug:
             return None
+        headers = {
+            "Referer": f"{BASE}/anime/{slug}",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Dest": "document",
+        }
         try:
-            resp = SESSION.get(
-                f"{BASE}/anime/{slug}/{ep_num}",
-                headers={"Referer": f"{BASE}/anime/{slug}"},
-                timeout=SCRAPE_TIMEOUT,
-            )
-            if resp.status_code != 200:
+            # The stream data lives in an Alpine vidstackPlayer blob that the
+            # server only includes for browser-navigation-style requests, and
+            # the origin intermittently times out (CF 524) or serves a variant
+            # without it — retry a few times before giving up.
+            import time as _time
+            blob = None
+            for attempt in range(3):
+                resp = SESSION.get(
+                    f"{BASE}/anime/{slug}/{ep_num}",
+                    headers=headers,
+                    timeout=SCRAPE_TIMEOUT * 2,
+                )
+                if resp.status_code == 200:
+                    blob = _parse_vidstack_blob(resp.text)
+                    if blob is not None:
+                        break
+                if attempt < 2:
+                    _time.sleep(1.5)
+            if blob is None:
                 return None
             text = resp.text
-            hls_m = re.search(r'<media-player[^>]+src="([^"]+\.m3u8[^"]*)"', text, re.I)
-            if not hls_m:
-                return None
-            hls = _decode_entities(hls_m.group(1))
+            if blob:
+                hls = blob.get("src", "")
+                subtitles = []
+                for sub in blob.get("subtitles", []) or []:
+                    file_url = sub.get("file", "")
+                    if file_url:
+                        subtitles.append({
+                            "url": file_url,
+                            "label": sub.get("title") or sub.get("language") or "",
+                            "lang": sub.get("language") or "",
+                        })
+            else:
+                # Fallback: old markup (media-player src + <track> elements).
+                hls_m = re.search(r'<media-player[^>]+src="([^"]+\.m3u8[^"]*)"', text, re.I)
+                if not hls_m:
+                    return None
+                hls = _decode_entities(hls_m.group(1))
+                subtitles = []
+                for t in re.finditer(r"<track\b([^>]*)>", text, re.I):
+                    attrs = t.group(1)
+                    kind = re.search(r'kind="([^"]*)"', attrs, re.I)
+                    if not kind or kind.group(1).lower() != "subtitles":
+                        continue
+                    src = re.search(r'src=["\']?([^\s"\'>]+)["\']?', attrs, re.I)
+                    label = re.search(r'label="([^"]*)"', attrs, re.I)
+                    srclang = re.search(r'srclang="([^"]*)"', attrs, re.I)
+                    if src:
+                        subtitles.append({
+                            "url": _decode_entities(src.group(1)),
+                            "label": label.group(1) if label else "",
+                            "lang": srclang.group(1) if srclang else "",
+                        })
 
-            subtitles = []
-            for t in re.finditer(r"<track\b([^>]*)>", text, re.I):
-                attrs = t.group(1)
-                kind = re.search(r'kind="([^"]*)"', attrs, re.I)
-                if not kind or kind.group(1).lower() != "subtitles":
-                    continue
-                src = re.search(r'src=["\']?([^\s"\'>]+)["\']?', attrs, re.I)
-                label = re.search(r'label="([^"]*)"', attrs, re.I)
-                srclang = re.search(r'srclang="([^"]*)"', attrs, re.I)
-                if src:
-                    subtitles.append({
-                        "url": _decode_entities(src.group(1)),
-                        "label": label.group(1) if label else "",
-                        "lang": srclang.group(1) if srclang else "",
-                    })
+            if not hls:
+                return None
 
             # Hand the player a synthetic master with the audio group preserved
             # and only the best-matching video variant, served locally — mpv skips
