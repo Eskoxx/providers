@@ -168,39 +168,43 @@ class BingrProvider(BaseProvider):
             url = chosen["url"]
             stream_quality = chosen.get("quality", "unknown")
 
-            # TV shows: route through the shared HLS proxy (parallel segment
-            # prefetch + urgent pool) instead of mpv's single sequential
-            # connection, which the CDNs throttle hard on episode streams.
+            # Route through the shared HLS proxy (parallel segment prefetch +
+            # urgent pool) instead of mpv's single sequential connection, which
+            # the CDNs throttle hard. prefer_audio=english fixes the default
+            # audio track: these masters list Hindi first with DEFAULT=NO on
+            # every group, which would otherwise make mpv play Hindi.
             proxy = None
-            if media_type == "tv":
-                try:
-                    proxy = HlsProxy(url, referer="https://bingr.one/", headers=HEADERS)
-                    url = proxy.master_url
-                except Exception:
-                    proxy = None
+            try:
+                proxy = HlsProxy(url, referer="https://bingr.one/", headers=HEADERS,
+                                 prefer_audio="english")
+                url = proxy.master_url
+            except Exception:
+                proxy = None
 
             subs: list[dict] = []
             for s in body.get("subtitles", []):
                 u = s.get("url", "")
                 if u and s.get("lang", "").lower().startswith("en"):
                     subs.append({"url": u, "label": s.get("label", ""), "lang": "en"})
-            if not subs:
-                try:
-                    r = SESSION.get(
-                        f"{API_BASE}/subtitles/vdrk/{media_type}/{tmdb_id}",
-                        params={"season": query.get("season", 1), "ep": query.get("episode", 1)},
-                        headers=HEADERS,
-                        timeout=SCRAPE_TIMEOUT,
-                    )
-                    if r.status_code == 200:
-                        seen = set()
-                        for s in r.json().get("subtitles", []):
-                            u = s.get("url", "")
-                            if u and s.get("lang") == "en" and u not in seen:
-                                seen.add(u)
-                                subs.append({"url": u, "label": s.get("label", ""), "lang": "en"})
-                except Exception:
-                    pass
+            # Always merge the vdrk track list too — the stream API only
+            # carries one English track while vdrk has the alternates
+            # ("English 2"/"English 3" …); dedup by URL, keep the order.
+            try:
+                r = SESSION.get(
+                    f"{API_BASE}/subtitles/vdrk/{media_type}/{tmdb_id}",
+                    params={"season": query.get("season", 1), "ep": query.get("episode", 1)},
+                    headers=HEADERS,
+                    timeout=SCRAPE_TIMEOUT,
+                )
+                if r.status_code == 200:
+                    seen = {s.get("url") for s in subs}
+                    for s in r.json().get("subtitles", []):
+                        u = s.get("url", "")
+                        if u and s.get("lang") == "en" and u not in seen:
+                            seen.add(u)
+                            subs.append({"url": u, "label": s.get("label", ""), "lang": "en"})
+            except Exception:
+                pass
 
             return StreamSource(
                 url=url,

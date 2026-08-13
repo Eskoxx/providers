@@ -37,11 +37,13 @@ class HlsProxy:
     SEG_TIMEOUT = 25
 
     def __init__(self, master_url: str, referer: str = "", headers: Optional[dict] = None,
-                 key_url: Optional[str] = None, variant_height: Optional[int] = None):
+                 key_url: Optional[str] = None, variant_height: Optional[int] = None,
+                 prefer_audio: Optional[str] = None):
         self._referer = referer
         self._headers = {"User-Agent": _DEFAULT_UA, **(headers or {})}
         self._key_url = key_url
         self._variant_height = variant_height
+        self._prefer_audio = prefer_audio
         self._local = threading.local()
         self._lock = threading.Lock()
         self._pool = ThreadPoolExecutor(max_workers=self.WORKERS, thread_name_prefix="hlsseg")
@@ -176,6 +178,24 @@ class HlsProxy:
                 if t in ("AUDIO", "SUBTITLES") and uri:
                     media.append((t, uri, attrs.get("DEFAULT") == "YES"))
 
+        # If a preferred audio language was requested, mark its group as the
+        # DEFAULT rendition so players (mpv) select it instead of the first
+        # one listed (multi-audio masters often list Hindi first with
+        # DEFAULT=NO on every group, which silently defaults to Hindi).
+        prefer_gi: Optional[int] = None
+        if self._prefer_audio:
+            pref = self._prefer_audio.lower()
+            for gi, (t, uri, default) in enumerate(media):
+                if t != "AUDIO":
+                    continue
+                mline = next((l for l in lines if l.startswith("#EXT-X-MEDIA") and f'URI="{uri}"' in l), None)
+                if mline is None:
+                    continue
+                matt = self._parse_attrs(mline)
+                name = (matt.get("NAME") or matt.get("LANGUAGE") or "").lower()
+                if pref in name and prefer_gi is None:
+                    prefer_gi = gi
+
         base = master_url[: master_url.rfind("/") + 1]
 
         media_routes = {}
@@ -254,7 +274,19 @@ class HlsProxy:
                 key = uri if "://" in uri else urljoin(base, uri)
                 route = media_routes.get(key)
                 if route:
-                    line = line.replace(f'URI="{uri}"', f'URI="{route}"')
+                    attrs["URI"] = route
+                    t = attrs.get("TYPE")
+                    if t == "AUDIO" and prefer_gi is not None:
+                        gi = next((k for k, (mt, mu, md) in enumerate(media)
+                                   if mu == uri and mt == "AUDIO"), None)
+                        if gi == prefer_gi:
+                            attrs["DEFAULT"] = "YES"
+                        elif "DEFAULT" not in attrs:
+                            attrs["DEFAULT"] = "NO"
+                    line = "#EXT-X-MEDIA:" + ",".join(
+                        f'{k}="{v}"' if isinstance(v, str) and (" " in v or "/" in v) else f"{k}={v}"
+                        for k, v in attrs.items()
+                    )
                 rewritten.append(line)
                 i += 1
             elif not line.startswith("#") and line.strip():
@@ -450,7 +482,10 @@ class _HlsProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def log_message(self, *a):
         pass
