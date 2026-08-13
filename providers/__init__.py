@@ -263,7 +263,7 @@ def _paginate_episodes(episodes: list[Episode], page_size: int = PAGE_SIZE) -> l
     return result
 
 
-def _provider_for(site_name: str) -> Optional[BaseProvider]:
+def _provider_for(site_name: str) -> Optional["BaseProvider"]:
     """Resolve a provider by site name; falls back to matching the provider's
     display name (multi-word names like 'YouTube Music')."""
     key = site_name.lower().strip()
