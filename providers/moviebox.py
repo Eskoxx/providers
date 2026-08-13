@@ -324,9 +324,13 @@ class MovieBoxProvider(BaseProvider):
                     poster = cover
                 season: Optional[int] = None
                 if media_type == "tv":
-                    m = re.search(r'\bS(\d+)\b', title)
-                    if m:
-                        season = int(m.group(1))
+                    # "S1-S3" style ranges mean ALL seasons — don't pin a single one.
+                    if re.search(r'\bS\d+\s*-\s*S\d+\b', title):
+                        season = None
+                    else:
+                        m = re.search(r'\bS(\d+)\b', title)
+                        if m:
+                            season = int(m.group(1))
                 display = f"{title} ({year})" if year else title
                 results.append(SearchResult(
                     title=display,
