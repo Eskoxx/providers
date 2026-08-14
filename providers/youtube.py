@@ -213,11 +213,17 @@ class YouTubeProvider(BaseProvider):
         """Cheap resolution for autoplay suggestions: ONE merged resolve and
         one probe — no retry storm, no extra calls. Dead signatures just skip
         to the next candidate (parallelized in the fetcher)."""
-        urls = self._resolve_direct(episode.url, "best[height<=1080]/best")
-        if urls and self._probe_ok(urls[0]):
-            return StreamSource(
-                url=urls[0], site_name=self.name, quality="best",
-                is_direct=True, extra_mpv_args=_MPV_EXTRAS)
+        # Probe until a full 1080p DASH pair is found — never fall back to
+        # low progressive formats. Dead signatures just skip the candidate.
+        fmt = ("bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/"
+               "bestvideo[height<=1080]+bestaudio/best")
+        for _ in range(3):
+            urls = self._resolve_direct(episode.url, fmt)
+            if urls and len(urls) >= 2 and self._probe_ok(urls[0]) and self._probe_ok(urls[1]):
+                return StreamSource(
+                    url=urls[0], site_name=self.name, quality="best",
+                    is_direct=True,
+                    extra_mpv_args=_MPV_EXTRAS + [f"--audio-file={urls[1]}"])
         return None
 
     def extract_stream(self, episode: Episode, audio_pref: str = "sub",

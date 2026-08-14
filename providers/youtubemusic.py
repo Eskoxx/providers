@@ -186,11 +186,17 @@ class YouTubeMusicProvider(BaseProvider):
     def resolve_suggestion(self, episode: Episode) -> Optional[StreamSource]:
         """Cheap resolution for autoplay suggestions: ONE attempt and one
         probe — no retry storm. Dead signatures skip to the next candidate."""
-        urls = self._resolve_direct(episode.url, "best[height<=720]/best")
-        if urls and self._probe_ok(urls[0]):
-            return StreamSource(
-                url=urls[0], site_name=self.name, quality="best",
-                is_direct=True, extra_mpv_args=None)
+        # Probe until a full 1080p DASH pair is found — never fall back to
+        # low progressive formats. Dead signatures just skip the candidate.
+        fmt = ("bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/"
+               "bestvideo[height<=1080]+bestaudio/best")
+        for _ in range(3):
+            urls = self._resolve_direct(episode.url, fmt)
+            if urls and len(urls) >= 2 and self._probe_ok(urls[0]) and self._probe_ok(urls[1]):
+                return StreamSource(
+                    url=urls[0], site_name=self.name, quality="best",
+                    is_direct=True,
+                    extra_mpv_args=[f"--audio-file={urls[1]}"])
         return None
 
     def extract_stream(self, episode: Episode, audio_pref: str = "sub",
@@ -216,9 +222,10 @@ class YouTubeMusicProvider(BaseProvider):
                     subtitles=None,
                     extra_mpv_args=[f"--audio-file={urls[1]}"],
                 )
-            urls = self._resolve_playable(episode.url, "best[height<=720]/best")
+            # No merged/720p fallback on Android either — hand the watch URL
+            # to the player so its own resolver picks the best quality.
             return StreamSource(
-                url=(urls[0] if urls else episode.url),
+                url=episode.url,
                 site_name=self.name,
                 quality="best",
                 is_direct=True,
@@ -245,16 +252,8 @@ class YouTubeMusicProvider(BaseProvider):
                     subtitles=None,
                     extra_mpv_args=[f"--audio-file={urls[1]}"],
                 )
-            urls = self._resolve_playable(episode.url, "bestaudio/best")
-            return StreamSource(
-                url=(urls[0] if urls else episode.url),
-                site_name=self.name,
-                quality="best",
-                is_direct=True,
-                headers=None,
-                subtitles=None,
-                extra_mpv_args=["--vid=no"],
-            )
+            # No low-quality fallback — the art-track pair must resolve.
+            return None
         # Video version: prefer the full-resolution DASH video + its separate
         # audio stream (mpv merges them via --audio-file). Falls back to the
         # highest single merged format, then to mpv's own yt-dlp resolution.
@@ -272,15 +271,8 @@ class YouTubeMusicProvider(BaseProvider):
                 subtitles=None,
                 extra_mpv_args=[f"--audio-file={urls[1]}"],
             )
-        urls = self._resolve_playable(episode.url, "best[height<=1080]/best")
-        return StreamSource(
-            url=(urls[0] if urls else episode.url),
-            site_name=self.name,
-            quality="best",
-            is_direct=True,
-            headers=None,
-            subtitles=None,
-        )
+        # No merged/360p fallback — the DASH pair must resolve.
+        return None
 
     def resolve(self, media: MediaResult, audio_pref: str = "sub",
                 quality_pref: str = "best") -> Optional[StreamSource]:
