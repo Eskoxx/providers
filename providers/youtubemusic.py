@@ -162,6 +162,37 @@ class YouTubeMusicProvider(BaseProvider):
         except Exception:
             return None
 
+    @staticmethod
+    def _probe_ok(url: str) -> bool:
+        """YouTube randomly hands out dead/half-dead signed URLs: some answer
+        a tiny range probe but 403 the full stream. Probe the FULL range
+        (bytes=0-) — exactly what the player requests."""
+        import urllib.request as _ur
+        try:
+            req = _ur.Request(url, method="GET", headers={"Range": "bytes=0-"})
+            with _ur.urlopen(req, timeout=5) as resp:
+                return resp.status in (200, 206)
+        except Exception:
+            return False
+
+    def _resolve_playable(self, url: str, fmt: str, tries: int = 5) -> Optional[list[str]]:
+        """Resolve with retries until the signed URLs actually fetch (200/206)."""
+        for _ in range(tries):
+            urls = self._resolve_direct(url, fmt)
+            if urls and all(self._probe_ok(u) for u in urls):
+                return urls
+        return None
+
+    def resolve_suggestion(self, episode: Episode) -> Optional[StreamSource]:
+        """Cheap resolution for autoplay suggestions: ONE attempt and one
+        probe — no retry storm. Dead signatures skip to the next candidate."""
+        urls = self._resolve_direct(episode.url, "best[height<=720]/best")
+        if urls and self._probe_ok(urls[0]):
+            return StreamSource(
+                url=urls[0], site_name=self.name, quality="best",
+                is_direct=True, extra_mpv_args=None)
+        return None
+
     def extract_stream(self, episode: Episode, audio_pref: str = "sub",
                        quality_pref: str = "best") -> Optional[StreamSource]:
         if not episode.url:
@@ -172,7 +203,7 @@ class YouTubeMusicProvider(BaseProvider):
             # mpegts proxy by the app (see _play_one_android). Pick h264/m4a
             # so the remux is stream-copy (no transcode). Fall back to a
             # single merged URL if the pair can't be resolved.
-            urls = self._resolve_direct(
+            urls = self._resolve_playable(
                 episode.url,
                 "bestvideo[ext=mp4][vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]/best")
             if urls and len(urls) >= 2:
@@ -185,7 +216,7 @@ class YouTubeMusicProvider(BaseProvider):
                     subtitles=None,
                     extra_mpv_args=[f"--audio-file={urls[1]}"],
                 )
-            urls = self._resolve_direct(episode.url, "best[height<=720]/best")
+            urls = self._resolve_playable(episode.url, "best[height<=720]/best")
             return StreamSource(
                 url=(urls[0] if urls else episode.url),
                 site_name=self.name,
@@ -200,7 +231,10 @@ class YouTubeMusicProvider(BaseProvider):
             # art) with the audio — sharpened to the 720p art format when
             # available (keeps the player window, controls and seeking, like
             # a music player).
-            urls = self._resolve_direct(episode.url, "bestvideo[height<=1080]+bestaudio/best")
+            urls = self._resolve_playable(
+                episode.url,
+                "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080]+bestaudio/best")
             if urls and len(urls) >= 2:
                 return StreamSource(
                     url=urls[0],
@@ -211,7 +245,7 @@ class YouTubeMusicProvider(BaseProvider):
                     subtitles=None,
                     extra_mpv_args=[f"--audio-file={urls[1]}"],
                 )
-            urls = self._resolve_direct(episode.url, "bestaudio/best")
+            urls = self._resolve_playable(episode.url, "bestaudio/best")
             return StreamSource(
                 url=(urls[0] if urls else episode.url),
                 site_name=self.name,
@@ -224,7 +258,10 @@ class YouTubeMusicProvider(BaseProvider):
         # Video version: prefer the full-resolution DASH video + its separate
         # audio stream (mpv merges them via --audio-file). Falls back to the
         # highest single merged format, then to mpv's own yt-dlp resolution.
-        urls = self._resolve_direct(episode.url, "bestvideo[height<=1080]+bestaudio/best")
+        urls = self._resolve_playable(
+            episode.url,
+            "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=1080]+bestaudio/best")
         if urls and len(urls) >= 2:
             return StreamSource(
                 url=urls[0],
@@ -235,7 +272,7 @@ class YouTubeMusicProvider(BaseProvider):
                 subtitles=None,
                 extra_mpv_args=[f"--audio-file={urls[1]}"],
             )
-        urls = self._resolve_direct(episode.url, "best[height<=1080]/best")
+        urls = self._resolve_playable(episode.url, "best[height<=1080]/best")
         return StreamSource(
             url=(urls[0] if urls else episode.url),
             site_name=self.name,

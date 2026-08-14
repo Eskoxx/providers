@@ -20,6 +20,7 @@ from .streamingunity import StreamingUnityProvider
 from .tmdb_search import TMDbProvider
 from .torrentprovider import TPBProvider, EZTVProvider, NyaaProvider
 from .youtubemusic import YouTubeMusicProvider
+from .youtube import YouTubeProvider
 from .loader import discover_providers
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,13 @@ MUSIC_PROVIDERS: dict[str, "BaseProvider"] = {
     "ytmusic": YouTubeMusicProvider(),
 }
 
+VIDEO_SITES: list[Site] = [
+    Site(name="YouTube", slug="youtube", url="https://www.youtube.com", rank=1, category="video"),
+]
+VIDEO_PROVIDERS: dict[str, "BaseProvider"] = {
+    "youtube": YouTubeProvider(),
+}
+
 TORRENT_SITES: list[Site] = [
     Site(name="TPB", slug="tpb", url="https://thepiratebay.org", rank=1, category="torrent"),
     Site(name="EZTV", slug="eztv", url="https://eztvx.to", rank=2, category="torrent"),
@@ -73,8 +81,8 @@ TORRENT_PROVIDERS: dict[str, TPBProvider | EZTVProvider | NyaaProvider] = {
     "nyaa": NyaaProvider(),
 }
 
-CONFIGURED_PROVIDERS = {**ANIME_PROVIDERS, **MOVIE_PROVIDERS, **MUSIC_PROVIDERS}
-CONFIGURED_SITES = ANIME_SITES + MOVIE_SITES + TORRENT_SITES + MUSIC_SITES
+CONFIGURED_PROVIDERS = {**ANIME_PROVIDERS, **MOVIE_PROVIDERS, **MUSIC_PROVIDERS, **VIDEO_PROVIDERS}
+CONFIGURED_SITES = ANIME_SITES + MOVIE_SITES + TORRENT_SITES + MUSIC_SITES + VIDEO_SITES
 
 # Merge user-provided plugins
 _plugins = discover_providers()
@@ -94,6 +102,9 @@ for _key, (_provider, _site) in _plugins.items():
     elif cat == "music":
         MUSIC_SITES.append(_site)
         MUSIC_PROVIDERS[_key] = _provider
+    elif cat == "video":
+        VIDEO_SITES.append(_site)
+        VIDEO_PROVIDERS[_key] = _provider
 
 ANIME_SITES.sort(key=lambda s: s.rank)
 MOVIE_SITES.sort(key=lambda s: s.rank)
