@@ -19,7 +19,6 @@ from .fmovies import FmoviesProvider
 from .netmirror import NetMirrorProvider
 from .moviebox import MovieBoxProvider
 from .streamingunity import StreamingUnityProvider
-from .tmdb_search import TMDbProvider
 from .torrentprovider import TPBProvider, EZTVProvider, NyaaProvider
 from .youtubemusic import YouTubeMusicProvider
 from .youtube import YouTubeProvider
@@ -59,7 +58,6 @@ MOVIE_PROVIDERS: dict[str, "BaseProvider"] = {
     "vidnest": VidNestProvider(),
     "moviebox": MovieBoxProvider(),
     "netmirror": NetMirrorProvider(),
-    "tmdb": TMDbProvider(),
 }
 
 MUSIC_SITES: list[Site] = [
