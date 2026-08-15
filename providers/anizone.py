@@ -157,36 +157,39 @@ class AniZoneProvider(BaseProvider):
             if resp.status_code != 200:
                 return results
             text = resp.text
-            for m in re.finditer(r'x-data="(\{[^"]*anmTitles[^"]*\})"', text):
-                ctx_end = min(len(text), m.end() + 3000)
-                ctx = text[m.start():ctx_end]
-                slug_m = re.search(r'href="(?:https://anizone\.to)?/anime/([a-z0-9-]+)"', ctx)
-                if not slug_m:
-                    continue
-                slug = slug_m.group(1)
-                xdata = _decode_entities(m.group(1))
-                raw = _extract_json_arg(xdata, "anmTitles")
+            # The results now live in an Alpine blob: items: JSON.parse('...').
+            for m in re.finditer(r"items: JSON\.parse\('((?:[^'\\]|\\.)*)'\)", text):
+                raw = m.group(1)
                 if not raw:
                     continue
-                title = _pick_title(_process_json_arg(raw))
-                if not title:
+                items = _process_json_arg(raw)
+                if not isinstance(items, list):
                     continue
-                # relevance: title must contain at least 2 whole query words
-                # (word-boundary match, so "one" doesn't match "stone")
-                tl = title.lower()
-                if q_words:
-                    hits = sum(1 for w in q_words if re.search(rf"\b{w}\b", tl))
-                    full = " ".join(q_words)
-                    if hits < 2 and full not in tl:
+                for item in items:
+                    if not isinstance(item, dict):
                         continue
-                if slug in seen:
-                    continue
-                seen.add(slug)
-                results.append(SearchResult(
-                    title=title,
-                    url=f"{BASE}/anime/{slug}",
-                    site_name=self.name,
-                ))
+                    slug = item.get("slug") or ""
+                    if not slug:
+                        continue
+                    titles = item.get("title_list") or {}
+                    title = item.get("main_title") or _pick_title(titles)
+                    if not title:
+                        continue
+                    tl = title.lower()
+                    if q_words:
+                        hits = sum(1 for w in q_words if re.search(rf"\b{w}\b", tl))
+                        full = " ".join(q_words)
+                        if hits < 2 and full not in tl:
+                            continue
+                    if slug in seen:
+                        continue
+                    seen.add(slug)
+                    results.append(SearchResult(
+                        title=title,
+                        url=f"{BASE}/anime/{slug}",
+                        site_name=self.name,
+                        image=item.get("cover") or "",
+                    ))
         except requests.RequestException:
             pass
         return results
