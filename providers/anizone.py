@@ -19,6 +19,10 @@ class _VariantHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def shutdown(self):
+        super().shutdown()
+        self.server_close()
+
     def __init__(self, body: bytes):
         self._body = body
         super().__init__(("127.0.0.1", 0), _VariantHandler)

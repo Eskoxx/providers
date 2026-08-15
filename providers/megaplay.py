@@ -22,6 +22,7 @@ from anime_watch.models import SearchResult, Episode, StreamSource
 from anime_watch.core import SESSION, SCRAPE_TIMEOUT
 from .base import BaseProvider
 from .anikoto import _http_get, _pick_hls_variant, _proxy_hls
+from .searchfallback import search_anilist, search_ladder, resolve_episode_count
 
 ANILIST_API = "https://graphql.anilist.co"
 MEGAPLAY_REFERER = "https://megaplay.buzz/"
@@ -64,34 +65,29 @@ class MegaPlayProvider(BaseProvider):
         return ["sub", "dub"]
 
     def search(self, query: str) -> list[SearchResult]:
-        results = []
-        try:
-            r = SESSION.post(
-                ANILIST_API,
-                json={"query": SEARCH_QUERY, "variables": {"search": query}},
-                timeout=15,
-            )
-            if r.status_code != 200:
-                return results
-            data = r.json()
-            for media in data.get("data", {}).get("Page", {}).get("media", []):
-                titles = media.get("title", {})
-                title = titles.get("romaji") or titles.get("english") or "Unknown"
-                aid = media.get("id")
+        def _build(items: list) -> list[SearchResult]:
+            out = []
+            for it in items:
+                aid = it.get("anilist_id")
                 if not aid:
                     continue
-                ep_count = media.get("episodes") or 0
-                year = (media.get("startDate") or {}).get("year", "") or ""
+                year = it.get("year") or ""
+                title = it.get("title") or "Unknown"
                 display = f"{title} ({year})" if year else title
-                results.append(SearchResult(
+                out.append(SearchResult(
                     title=display,
                     url=f"{self.url}/stream/ani/{aid}/1/sub",
                     site_name=self.name,
-                    image=media.get("coverImage", {}).get("large", "") or "",
-                    data={"anilist_id": str(aid), "episodes": ep_count, "year": year},
+                    image=it.get("image") or "",
+                    data={"anilist_id": str(aid), "episodes": it.get("episodes") or 0,
+                          "year": year},
                 ))
-        except Exception:
-            pass
+            return out
+
+        results = _build(search_anilist(query))
+        if not results:
+            # AniList is down — Kitsu, anikoto scrape, then disk cache.
+            results = _build(search_ladder(self.slug, query))
         return results
 
     def get_episodes(self, result: SearchResult) -> list[Episode]:
@@ -103,21 +99,9 @@ class MegaPlayProvider(BaseProvider):
         except (ValueError, TypeError):
             total = 0
         if total <= 0:
-            # Airing shows report null episodes; derive from the schedule.
-            try:
-                r = SESSION.post(
-                    ANILIST_API,
-                    json={"query": MEDIA_QUERY, "variables": {"id": int(aid)}},
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    md = r.json().get("data", {}).get("Media", {})
-                    total = md.get("episodes") or 0
-                    if not total:
-                        nxt = md.get("nextAiringEpisode") or {}
-                        total = max((nxt.get("episode") or 1) - 1, 1)
-            except Exception:
-                pass
+            # Airing shows report null episodes — resolve from ani.zip
+            # (reliable cross-database service), then the disk cache.
+            total = resolve_episode_count(self.slug, aid)
         if total <= 0:
             total = 12
         an = result.title.split(" (")[0].strip()

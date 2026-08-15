@@ -19,6 +19,7 @@ except ImportError:
 
 from anime_watch.models import SearchResult, Episode, StreamSource
 from .base import BaseProvider
+from .searchfallback import search_anilist, search_ladder
 
 logger = logging.getLogger(__name__)
 
@@ -194,36 +195,29 @@ class TryEmbedProvider(BaseProvider):
         return ["sub", "dub"]
 
     def search(self, query: str) -> list[SearchResult]:
-        results = []
-        try:
-            s = _new_session()
-            r = s.post(ANILIST_API, json={"query": SEARCH_QUERY, "variables": {"search": query}}, timeout=15)
-            if r.status_code != 200:
-                return results
-            data = r.json()
-            for media in data.get("data", {}).get("Page", {}).get("media", []):
-                titles = media.get("title", {})
-                title = titles.get("romaji") or titles.get("english") or "Unknown"
-                aid = media.get("id")
+        def _build(items: list) -> list[SearchResult]:
+            out = []
+            for it in items:
+                aid = it.get("anilist_id")
                 if not aid:
                     continue
-                ep_count = media.get("episodes") or 0
-                year = ""
-                sd = media.get("startDate")
-                if sd:
-                    year = str(sd.get("year", ""))
-                display = title
-                if year:
-                    display = f"{title} ({year})"
-                results.append(SearchResult(
+                year = it.get("year") or ""
+                title = it.get("title") or "Unknown"
+                display = f"{title} ({year})" if year else title
+                out.append(SearchResult(
                     title=display,
                     url=f"{TRYEMBED_HOST}/embed/anime/{aid}/1/sub",
                     site_name=self.name,
-                    image=media.get("coverImage", {}).get("large", "") or "",
-                    data={"anilist_id": str(aid), "episodes": ep_count, "year": year},
+                    image=it.get("image") or "",
+                    data={"anilist_id": str(aid), "episodes": it.get("episodes") or 0,
+                          "year": year},
                 ))
-        except Exception as e:
-            logger.warning("TryEmbed search failed: %s", e)
+            return out
+
+        results = _build(search_anilist(query))
+        if not results:
+            # AniList is down — Kitsu, anikoto scrape, then disk cache.
+            results = _build(search_ladder(self.slug, query))
         return results
 
     def _episode_category(self, ep_num, ep_data, default_season="Season 1"):

@@ -88,6 +88,21 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def shutdown(self):
+        # HTTPServer.shutdown() stops serve_forever but never closes the
+        # listening socket — without server_close() the port stays bound
+        # (leaked fd) until the app process exits.
+        super().shutdown()
+        self.server_close()
+        # The prefetcher executor threads are non-daemon: without shutdown()
+        # they stay alive (blocking interpreter exit) and in-flight segment
+        # fetches keep hammering the CDN after the player is gone.
+        self._closed = True
+        try:
+            self._prefetcher.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
     def __init__(self, playlist, variants, referer, seg_map, playlist_url, variant_src_urls=None):
         self._playlist = playlist
         self._variants = variants
@@ -96,6 +111,7 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         self._playlist_url = playlist_url
         self._variant_src_urls = variant_src_urls or {}
         self._seg_cache: dict[str, bytes] = {}
+        self._closed = False
         # Low concurrency: the tiktokcdn edge blackholes bursts of parallel
         # connections from one IP for seconds; a gentle prefetch avoids
         # tripping it harder while the player streams.
@@ -117,6 +133,8 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     def prefetch(self, path: str, ahead: int = 4) -> None:
         """Pre-fetch the next segments after the requested one so the player
         never waits on the slow CDN between segments (segment attach lag)."""
+        if self._closed:
+            return
         try:
             keys = self._ordered_paths()
             if path not in keys:
@@ -137,6 +155,8 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
             return None
         data: Optional[bytes] = None
         for attempt in range(_SEG_RETRIES + 1):
+            if self._closed:
+                return None
             try:
                 resp = _http_get(
                     orig_url,
@@ -150,6 +170,8 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
                 pass
             if data is not None:
                 break
+            if self._closed:
+                return None
             if attempt < _SEG_RETRIES:
                 if not self.refresh_segments():
                     _time.sleep(_SEG_RETRY_SLEEP)

@@ -88,6 +88,10 @@ class _ProxyHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.referer = referer
         super().__init__(("127.0.0.1", 0), _ProxyRequestHandler)
 
+    def shutdown(self):
+        super().shutdown()
+        self.server_close()
+
 
 class _ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
     server: _ProxyHTTPServer

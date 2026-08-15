@@ -223,6 +223,7 @@ class _PlaylistServer(socketserver.ThreadingMixIn, HTTPServer):
         super().__init__(("127.0.0.1", 0), _PlaylistHandler)
     def shutdown(self):
         super().shutdown()
+        self.server_close()
 
 
 class FmoviesProvider(BaseProvider):
