@@ -9,6 +9,8 @@ from anime_watch.core import (
 )
 from .anidb import AniDBProvider
 from .anikoto import AnikotoProvider
+from .megaplay import MegaPlayProvider
+from .vidnest import VidNestProvider
 from .tryembed import TryEmbedProvider
 from .anineko import AniNekoProvider
 from .anizone import AniZoneProvider
@@ -27,30 +29,34 @@ logger = logging.getLogger(__name__)
 
 ANIME_SITES = [
     Site(name="Anikoto", slug="anikoto", url="https://anikototv.to", rank=1, category="anime"),
-    Site(name="AniDB", slug="anidb", url="https://anidb.app", rank=2, category="anime"),
-    Site(name="TryEmbed", slug="tryembed", url="https://tryembed.us.cc", rank=3, category="anime"),
-    Site(name="AniNeko", slug="anineko", url="https://anineko.to", rank=4, category="anime"),
-    Site(name="AniZone", slug="anizone", url="https://anizone.to", rank=5, category="anime"),
+    Site(name="MegaPlay", slug="megaplay", url="https://megaplay.buzz", rank=2, category="anime"),
+    Site(name="AniDB", slug="anidb", url="https://anidb.app", rank=3, category="anime"),
+    Site(name="TryEmbed", slug="tryembed", url="https://tryembed.us.cc", rank=4, category="anime"),
+    Site(name="AniNeko", slug="anineko", url="https://anineko.to", rank=5, category="anime"),
+    Site(name="AniZone", slug="anizone", url="https://anizone.to", rank=6, category="anime"),
 ]
 ANIME_PROVIDERS = {
     "anidb": AniDBProvider(),
     "anikoto": AnikotoProvider(),
+    "megaplay": MegaPlayProvider(),
     "tryembed": TryEmbedProvider(),
     "anineko": AniNekoProvider(),
     "anizone": AniZoneProvider(),
 }
 
 MOVIE_SITES: list[Site] = [
-    Site(name="Bingr", slug="bingr", url="https://bingr.one", rank=1, category="movies"),
-    Site(name="Fmovies", slug="fmovies", url="https://www.fmovies.gd", rank=2, category="movies"),
+    Site(name="VidNest", slug="vidnest", url="https://vidnest.fun", rank=1, category="movies"),
+    Site(name="Bingr", slug="bingr", url="https://bingr.one", rank=2, category="movies"),
+    Site(name="Fmovies", slug="fmovies", url="https://www.fmovies.gd", rank=4, category="movies"),
     Site(name="StreamingUnity", slug="streamingunity", url="https://streamingunity.dog", rank=3, category="movies"),
-    Site(name="MovieBox", slug="moviebox", url="https://moviebox.app", rank=4, category="movies"),
-    Site(name="NetMirror", slug="netmirror", url="https://net77.cc", rank=5, category="movies"),
+    Site(name="MovieBox", slug="moviebox", url="https://moviebox.app", rank=5, category="movies"),
+    Site(name="NetMirror", slug="netmirror", url="https://net77.cc", rank=6, category="movies"),
 ]
 MOVIE_PROVIDERS: dict[str, "BaseProvider"] = {
     "bingr": BingrProvider(),
     "fmovies": FmoviesProvider(),
     "streamingunity": StreamingUnityProvider(),
+    "vidnest": VidNestProvider(),
     "moviebox": MovieBoxProvider(),
     "netmirror": NetMirrorProvider(),
     "tmdb": TMDbProvider(),
