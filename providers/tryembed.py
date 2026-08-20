@@ -76,8 +76,24 @@ def _rewrite_playlist(data: bytes, playlist_url: str, server) -> bytes:
     for line in data.decode("utf-8", "replace").splitlines():
         sline = line.strip()
         if sline and not sline.startswith("#"):
+            # tryembed's own media playlists already route every segment
+            # through /s//m3u8-proxy?url={CDN}&headers={...} — our /s/
+            # handler fetches those with the right referer and strips the
+            # PNG shell. Re-wrapping them would drop the required headers
+            # and the CDN would 403 (broken playback). Pass them through.
             target = sline if sline.startswith("http") else \
                 playlist_url.rsplit("/", 1)[0] + "/" + sline
+            # tryembed's own segment lines are /m3u8-proxy?url={CDN}&headers={…}
+            # — the CDN 403s on direct fetches, only tryembed's server-side
+            # proxy (with the browser session) can serve them. Rewrite them to
+            # /s//m3u8-proxy… so OUR /s/ handler forwards them through
+            # tryembed (headers preserved, PNG stripped). Never re-wrap.
+            if sline.startswith("/m3u8-proxy"):
+                out.append("/s/" + sline)
+                continue
+            if sline.startswith("/s/"):
+                out.append(sline)
+                continue
             out.append(f"{base}/m3u8-proxy?url={quote(target, safe='')}")
         elif 'URI="' in line:
             def _sub(m):

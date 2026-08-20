@@ -149,12 +149,16 @@ class YouTubeMusicProvider(BaseProvider):
         return []
 
     @staticmethod
-    def _resolve_direct(url: str, fmt: str) -> Optional[list[str]]:
+    def _resolve_direct(url: str, fmt: str,
+                        client: str = "") -> Optional[list[str]]:
         """Resolve the watch URL to direct media streams once via yt-dlp, so
         mpv plays them with no yt-dlp involvement (faster startup, less load)."""
+        args = ["yt-dlp", "-g", "-f", fmt, "--no-warnings"]
+        if client:
+            args += ["--extractor-args", f"youtube:player_client={client}"]
+        args.append(url)
         try:
-            r = _sp.run(["yt-dlp", "-g", "-f", fmt, "--no-warnings", url],
-                        capture_output=True, text=True, timeout=30)
+            r = _sp.run(args, capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 return None
             lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
@@ -175,10 +179,15 @@ class YouTubeMusicProvider(BaseProvider):
         except Exception:
             return False
 
-    def _resolve_playable(self, url: str, fmt: str, tries: int = 5) -> Optional[list[str]]:
-        """Resolve with retries until the signed URLs actually fetch (200/206)."""
+    def _resolve_playable(self, url: str, fmt: str, tries: int = 3) -> Optional[list[str]]:
+        """Resolve with retries until the signed URLs actually fetch (200/206).
+
+        YouTube's android client now hands out dead URLs (403); fall back to
+        the web_embedded player client when the default client's URLs fail."""
+        # YouTube's android client now hands out dead URLs (403). web_embedded
+        # is the only client that produces live URLs — use it directly.
         for _ in range(tries):
-            urls = self._resolve_direct(url, fmt)
+            urls = self._resolve_direct(url, fmt, client="web_embedded")
             if urls and all(self._probe_ok(u) for u in urls):
                 return urls
         return None

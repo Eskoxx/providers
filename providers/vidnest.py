@@ -98,8 +98,17 @@ class VidNestProvider(BaseProvider):
             url = f"{VIDNEST_BACKEND}/hollymoviehd/movie/{tmdb_id}"
         else:
             url = f"{VIDNEST_BACKEND}/hollymoviehd/tv/{tmdb_id}/{season}/{episode}"
-        resp = _http_get(url, timeout=SCRAPE_TIMEOUT)
-        if resp.status_code != 200:
+        # new.vidnest.fun is flaky — intermittent 502s on the backend. Retry
+        # with a short backoff before giving up.
+        import time as _time
+        resp = None
+        for attempt in range(4):
+            resp = _http_get(url, timeout=SCRAPE_TIMEOUT)
+            if resp.status_code != 502:
+                break
+            if attempt < 3:
+                _time.sleep(1.0 + attempt)
+        if resp is None or resp.status_code != 200:
             return None
         try:
             body = resp.json()
